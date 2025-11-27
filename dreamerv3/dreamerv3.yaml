@@ -60,6 +60,7 @@ defaults:
   data_loaders: 8
 
   # World Model
+  world_model_type: rssm  # Options: 'rssm' or 'planet'
   grad_heads: [decoder, reward, cont]
   rssm:
     {
@@ -291,3 +292,46 @@ xlarge:
   .*\.cnn_depth: 96
   .*\.units: 1024
   .*\.layers: 5
+
+# PlaNet Configuration
+planet:
+  world_model_type: planet
+  # PlaNet uses MSE loss instead of KL divergence
+  dyn_loss: { impl: mse, free: 0.0 }
+  rep_loss: { impl: none, free: 0.0 }
+  # Adjust loss scales for PlaNet
+  loss_scales.dyn: 1.0
+  loss_scales.rep: 0.0
+
+planet_small:
+  world_model_type: planet
+  rssm.deter: 512
+  .*\.cnn_depth: 32
+  .*\.units: 512
+  .*\.layers: 2
+  dyn_loss: { impl: mse, free: 0.0 }
+  rep_loss: { impl: none, free: 0.0 }
+  loss_scales.dyn: 1.0
+  loss_scales.rep: 0.0
+
+planet_medium:
+  world_model_type: planet
+  rssm.deter: 1024
+  .*\.cnn_depth: 48
+  .*\.units: 640
+  .*\.layers: 3
+  dyn_loss: { impl: mse, free: 0.0 }
+  rep_loss: { impl: none, free: 0.0 }
+  loss_scales.dyn: 1.0
+  loss_scales.rep: 0.0
+
+planet_large:
+  world_model_type: planet
+  rssm.deter: 2048
+  .*\.cnn_depth: 64
+  .*\.units: 768
+  .*\.layers: 4
+  dyn_loss: { impl: mse, free: 0.0 }
+  rep_loss: { impl: none, free: 0.0 }
+  loss_scales.dyn: 1.0
+  loss_scales.rep: 0.0

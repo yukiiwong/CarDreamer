@@ -133,7 +133,18 @@ class WorldModel(nj.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
         shapes = {k: v for k, v in shapes.items() if not k.startswith("log_")}
         self.encoder = nets.MultiEncoder(shapes, **config.encoder, name="enc")
-        self.rssm = nets.RSSM(**config.rssm, name="rssm")
+
+        # Select world model type based on config
+        wm_type = getattr(config, "world_model_type", "rssm").lower()
+        if wm_type == "planet":
+            print("Using PlaNet world model")
+            self.rssm = nets.PlaNet(**config.rssm, name="rssm")
+        elif wm_type == "rssm":
+            print("Using RSSM world model")
+            self.rssm = nets.RSSM(**config.rssm, name="rssm")
+        else:
+            raise ValueError(f"Unknown world model type: {wm_type}. Choose 'rssm' or 'planet'")
+
         self.heads = {
             "decoder": nets.MultiDecoder(shapes, **config.decoder, name="dec"),
             "reward": nets.MLP((), **config.reward_head, name="rew"),

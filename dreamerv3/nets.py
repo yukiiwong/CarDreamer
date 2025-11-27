@@ -20,6 +20,176 @@ def sg(x):
 cast = jaxutils.cast_to_compute
 
 
+class PlaNet(nj.Module):
+    """
+    PlaNet: Deep Planning Network
+    A deterministic latent state model without stochastic components.
+    Paper: Learning Latent Dynamics for Planning from Pixels (ICML 2019)
+    """
+
+    def __init__(
+        self,
+        deter=1024,
+        stoch=32,  # Kept for API compatibility but not used
+        classes=32,  # Kept for API compatibility but not used
+        unroll=False,
+        initial="learned",
+        unimix=0.01,  # Not used in PlaNet
+        action_clip=1.0,
+        **kw,
+    ):
+        self._deter = deter
+        self._stoch = stoch  # For compatibility
+        self._classes = classes  # For compatibility
+        self._unroll = unroll
+        self._initial = initial
+        self._action_clip = action_clip
+        self._kw = kw
+
+    def initial(self, bs):
+        # PlaNet only has deterministic state
+        state = dict(
+            deter=jnp.zeros([bs, self._deter], f32),
+            stoch=jnp.zeros([bs, self._deter], f32),  # Same as deter for compatibility
+        )
+        if self._initial == "zeros":
+            return cast(state)
+        elif self._initial == "learned":
+            deter = self.get("initial", jnp.zeros, state["deter"][0].shape, f32)
+            state["deter"] = jnp.repeat(jnp.tanh(deter)[None], bs, 0)
+            state["stoch"] = state["deter"]  # For compatibility with existing code
+            return cast(state)
+        else:
+            raise NotImplementedError(self._initial)
+
+    def observe(self, embed, action, is_first, state=None):
+        def swap(x):
+            return x.transpose([1, 0] + list(range(2, len(x.shape))))
+
+        if state is None:
+            state = self.initial(action.shape[0])
+
+        def step(prev, inputs):
+            prev_action, embed, is_first = inputs
+            return self.obs_step(prev, prev_action, embed, is_first)
+
+        inputs = swap(action), swap(embed), swap(is_first)
+        post = jaxutils.scan(step, inputs, state, self._unroll)
+        post = {k: swap(v) for k, v in post.items()}
+        # PlaNet doesn't have separate prior, return post as both
+        prior = post
+        return post, prior
+
+    def imagine(self, action, state=None):
+        def swap(x):
+            return x.transpose([1, 0] + list(range(2, len(x.shape))))
+
+        state = self.initial(action.shape[0]) if state is None else state
+        assert isinstance(state, dict), state
+        action = swap(action)
+        prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+        prior = {k: swap(v) for k, v in prior.items()}
+        return prior
+
+    def get_dist(self, state, argmax=False):
+        # PlaNet is deterministic, return a delta distribution
+        mean = state["stoch"].astype(f32)
+        # Use very small std to approximate deterministic
+        std = jnp.ones_like(mean) * 0.001
+        return tfd.MultivariateNormalDiag(mean, std)
+
+    def obs_step(self, prev_state, prev_action, embed, is_first):
+        is_first = cast(is_first)
+        prev_action = cast(prev_action)
+        if self._action_clip > 0.0:
+            prev_action *= sg(
+                self._action_clip / jnp.maximum(self._action_clip, jnp.abs(prev_action))
+            )
+        prev_state, prev_action = jax.tree_util.tree_map(
+            lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action)
+        )
+        prev_state = jax.tree_util.tree_map(
+            lambda x, y: x + self._mask(y, is_first),
+            prev_state,
+            self.initial(len(is_first)),
+        )
+
+        # Predict next state (prior)
+        prior = self.img_step(prev_state, prev_action)
+
+        # Update with observation (posterior)
+        x = jnp.concatenate([prior["deter"], embed], -1)
+        x = self.get("obs_out", Linear, **self._kw)(x)
+        x = self.get("obs_linear", Linear, self._deter, **self._kw)(x)
+
+        post = {
+            "deter": x,
+            "stoch": x,  # For compatibility
+        }
+        return cast(post), cast(prior)
+
+    def img_step(self, prev_state, prev_action):
+        prev_deter = prev_state["deter"]
+        prev_action = cast(prev_action)
+        if self._action_clip > 0.0:
+            prev_action *= sg(
+                self._action_clip / jnp.maximum(self._action_clip, jnp.abs(prev_action))
+            )
+        if len(prev_action.shape) > len(prev_deter.shape):  # 2D actions.
+            shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
+            prev_action = prev_action.reshape(shape)
+
+        # Transition: s_t+1 = f(s_t, a_t)
+        x = jnp.concatenate([prev_deter, prev_action], -1)
+        x = self.get("img_in", Linear, **self._kw)(x)
+        x, deter = self._gru(x, prev_deter)
+
+        prior = {"deter": deter, "stoch": deter}  # stoch = deter for compatibility
+        return cast(prior)
+
+    def get_stoch(self, deter):
+        # For PlaNet, stoch is just deter
+        return cast(deter)
+
+    def _gru(self, x, deter):
+        x = jnp.concatenate([deter, x], -1)
+        kw = {**self._kw, "act": "none", "units": 3 * self._deter}
+        x = self.get("gru", Linear, **kw)(x)
+        reset, cand, update = jnp.split(x, 3, -1)
+        reset = jax.nn.sigmoid(reset)
+        cand = jnp.tanh(reset * cand)
+        update = jax.nn.sigmoid(update - 1)
+        deter = update * cand + (1 - update) * deter
+        return deter, deter
+
+    def _mask(self, value, mask):
+        return jnp.einsum("b...,b->b...", value, mask.astype(value.dtype))
+
+    def dyn_loss(self, post, prior, impl="mse", free=0.0):
+        # PlaNet uses MSE loss for dynamics
+        if impl == "mse":
+            loss = jnp.square(post["deter"] - prior["deter"]).sum(-1)
+        elif impl == "kl":
+            # Fallback to approximate KL for compatibility
+            loss = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+        else:
+            raise NotImplementedError(impl)
+        if free:
+            loss = jnp.maximum(loss, free)
+        return loss
+
+    def rep_loss(self, post, prior, impl="none", free=0.0):
+        # PlaNet doesn't have representation loss (no stochastic component)
+        # Return zero loss for compatibility
+        if impl in ("none", "kl", "uniform", "entropy"):
+            loss = jnp.zeros(post["deter"].shape[:-1])
+        else:
+            raise NotImplementedError(impl)
+        if free:
+            loss = jnp.maximum(loss, free)
+        return loss
+
+
 class RSSM(nj.Module):
     def __init__(
         self,
